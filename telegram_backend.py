@@ -11,7 +11,9 @@ from typing import List, Dict, Optional, Union
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import json
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -28,10 +30,10 @@ from telethon.tl.functions.channels import GetParticipantsRequest
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# API Configuration
-API_ID = 22420582
-API_HASH = "ddbb8fc720ea481bd9033f3cabb0518d"
-SESSION_STRING = "1BVtsOHwBuzx8X2jjY6qmgXP2ypC4Y1T5nnrkEZTQWXYeLKje1Hu86wFW-NHcpwJ_qHFssrvt5VB73dIyK_HtAv-EO_tZP778IYmieHHr08BEmrNQzWn7f3vtnMdaNM3EysNzpJQq551GqQRvT_cwFVTLSrRGVaKMgfw60LlAEDhCcK7AEJYJCEULjs-WR5cttNr_kSHn6V4aJViEtXyJMkey_9_jMt0SgF0n6gUfRViADMvs0K6hi9gXHPpQ2lEagKbTHRrS2Hg8NOKcvUr6uFvUL4nlkVYdqjdJVJvqNu8sPyTyxWEOeqejXvtrWk3UBdO9dk_Sok0kVx8xQWLiQ0d7JbLastM="
+# API Configuration - Use environment variables with fallbacks
+API_ID = int(os.getenv('TELEGRAM_API_ID', '22420582'))
+API_HASH = os.getenv('TELEGRAM_API_HASH', 'ddbb8fc720ea481bd9033f3cabb0518d')
+SESSION_STRING = os.getenv('TELEGRAM_SESSION_STRING', '1BVtsOHwBuzx8X2jjY6qmgXP2ypC4Y1T5nnrkEZTQWXYeLKje1Hu86wFW-NHcpwJ_qHFssrvt5VB73dIyK_HtAv-EO_tZP778IYmieHHr08BEmrNQzWn7f3vtnMdaNM3EysNzpJQq551GqQRvT_cwFVTLSrRGVaKMgfw60LlAEDhCcK7AEJYJCEULjs-WR5cttNr_kSHn6V4aJViEtXyJMkey_9_jMt0SgF0n6gUfRViADMvs0K6hi9gXHPpQ2lEagKbTHRrS2Hg8NOKcvUr6uFvUL4nlkVYdqjdJVJvqNu8sPyTyxWEOeqejXvtrWk3UBdO9dk_Sok0kVx8xQWLiQ0d7JbLastM=')
 
 # FastAPI app
 app = FastAPI(title="Telegram Member Scraper API", version="1.0.0")
@@ -78,8 +80,8 @@ async def get_telegram_client():
     
     if telegram_client is None or not telegram_client.is_connected():
         try:
-            # Use session string from environment or hardcoded
-            session_str = os.getenv('TELEGRAM_SESSION_STRING', SESSION_STRING)
+            # Use session string from environment
+            session_str = SESSION_STRING
             telegram_client = TelegramClient(
                 StringSession(session_str), 
                 API_ID, 
@@ -222,6 +224,158 @@ async def health_check():
             "telegram_connected": False,
             "error": str(e)
         }
+
+async def scrape_group_members_progressive(client: TelegramClient, group_entity, limit: Optional[int] = None):
+    """Progressive scraping with yield for streaming"""
+    members = []
+    offset = 0
+    total_scraped = 0
+    batch_count = 0
+    
+    group_name = getattr(group_entity, 'title', 'Unknown Group')
+    
+    try:
+        while True:
+            if limit and total_scraped >= limit:
+                break
+            
+            batch_size = min(50, limit - total_scraped if limit else 50)  # Smaller batches for streaming
+            
+            # Get participants
+            participants = await client(GetParticipantsRequest(
+                channel=group_entity,
+                filter=ChannelParticipantsRecent(),
+                offset=offset,
+                limit=batch_size,
+                hash=0
+            ))
+            
+            if not participants.users:
+                break
+            
+            batch_members = []
+            # Process users in this batch
+            for user in participants.users:
+                if isinstance(user, User):
+                    contact = extract_user_info(user)
+                    batch_members.append(contact)
+                    members.append(contact)
+                    total_scraped += 1
+                    
+                    if limit and total_scraped >= limit:
+                        break
+            
+            # Yield progress update
+            if batch_members:
+                batch_count += 1
+                yield {
+                    "type": "progress",
+                    "group_name": group_name,
+                    "batch": batch_count,
+                    "processed": total_scraped,
+                    "new_members": len(batch_members),
+                    "members": [contact.dict() for contact in batch_members]
+                }
+            
+            offset += len(participants.users)
+            
+            # Rate limiting
+            await asyncio.sleep(0.5)  # Faster for streaming
+            
+    except Exception as e:
+        yield {
+            "type": "error",
+            "group_name": group_name,
+            "error": str(e)
+        }
+        return
+    
+    # Final summary for this group
+    yield {
+        "type": "group_complete",
+        "group_name": group_name,
+        "total_members": len(members),
+        "all_members": [contact.dict() for contact in members]
+    }
+
+@app.post("/api/scrape-progress")
+async def scrape_telegram_members_progressive(request: ScrapeRequest):
+    """Progressive scraping with Server-Sent Events"""
+    
+    async def event_stream():
+        start_time = datetime.now()
+        
+        try:
+            # Send initial connection event
+            yield f"data: {json.dumps({'type': 'connected', 'message': 'Starting progressive scraping...'})}\n\n"
+            
+            # Get Telegram client
+            client = await get_telegram_client()
+            
+            # Parse group links
+            group_links = [link.strip() for link in request.group_links.split('\n') if link.strip()]
+            
+            if not group_links:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'No valid group links provided'})}\n\n"
+                return
+            
+            all_contacts = []
+            processed_groups = 0
+            
+            # Process each group
+            for group_link in group_links:
+                try:
+                    yield f"data: {json.dumps({'type': 'group_start', 'group_url': group_link, 'progress': processed_groups + 1, 'total_groups': len(group_links)})}\n\n"
+                    
+                    # Get group entity
+                    group_entity = await get_group_entity(client, group_link)
+                    
+                    # Calculate remaining limit
+                    remaining_limit = None
+                    if request.member_limit:
+                        remaining_limit = request.member_limit - len(all_contacts)
+                        if remaining_limit <= 0:
+                            break
+                    
+                    # Progressive scraping
+                    async for update in scrape_group_members_progressive(client, group_entity, remaining_limit):
+                        yield f"data: {json.dumps(update)}\n\n"
+                        
+                        # Add members to total
+                        if update.get('type') == 'group_complete':
+                            all_contacts.extend([ContactInfo(**member) for member in update['all_members']])
+                    
+                    processed_groups += 1
+                    
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'group_error', 'group_url': group_link, 'error': str(e)})}\n\n"
+                    continue
+            
+            # Remove duplicates
+            unique_contacts = {}
+            for contact in all_contacts:
+                if contact.id not in unique_contacts:
+                    unique_contacts[contact.id] = contact
+            
+            final_contacts = list(unique_contacts.values())
+            processing_time = (datetime.now() - start_time).total_seconds()
+            
+            # Send final results
+            yield f"data: {json.dumps({'type': 'complete', 'total_contacts': len(final_contacts), 'processing_time': processing_time, 'contacts': [contact.dict() for contact in final_contacts]})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Internal server error: {str(e)}'})}\n\n"
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape_telegram_members(request: ScrapeRequest):
