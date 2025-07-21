@@ -274,7 +274,7 @@ async def scrape_group_members_progressive(client: TelegramClient, group_entity,
                     "batch": batch_count,
                     "processed": total_scraped,
                     "new_members": len(batch_members),
-                    "members": [contact.dict() for contact in batch_members]
+                    "members": [contact.model_dump() for contact in batch_members]
                 }
             
             offset += len(participants.users)
@@ -295,7 +295,7 @@ async def scrape_group_members_progressive(client: TelegramClient, group_entity,
         "type": "group_complete",
         "group_name": group_name,
         "total_members": len(members),
-        "all_members": [contact.dict() for contact in members]
+        "all_members": [contact.model_dump() for contact in members]
     }
 
 @app.post("/api/scrape-progress")
@@ -361,7 +361,7 @@ async def scrape_telegram_members_progressive(request: ScrapeRequest):
             processing_time = (datetime.now() - start_time).total_seconds()
             
             # Send final results
-            yield f"data: {json.dumps({'type': 'complete', 'total_contacts': len(final_contacts), 'processing_time': processing_time, 'contacts': [contact.dict() for contact in final_contacts]})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'total_contacts': len(final_contacts), 'processing_time': processing_time, 'contacts': [contact.model_dump() for contact in final_contacts]})}\n\n"
             
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': f'Internal server error: {str(e)}'})}\n\n"
